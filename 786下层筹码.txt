@@ -4,6 +4,7 @@ const below = chip.below_percent
 const top5 = Array.isArray(chip.top5_holders) ? chip.top5_holders : []
 const L = ctx.logearn || {}
 const KI = ctx.kline_and_indicators || {}
+const G = ctx.gmgn || {}
 const ca = L.token_address
 
 const BLACKLIST = ['BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh']
@@ -61,9 +62,14 @@ if (typeof below !== 'number') {
   return false
 }
 
+// 开发者持仓占比（gmgn.stat.creator_hold_rate 是 0-1 小数，×100 转成 %；取不到时兜底用 dev.creator_token_status）
+const stat = G.stat || {}
+const devHoldPct = stat.creator_hold_rate != null ? parseFloat(stat.creator_hold_rate) * 100 : NaN
+
 // ===== 筹码条件：满足即买入，不满足直接过滤 =====
 const checks = [
-  ['下方筹码占比', below > 25, below.toFixed(2) + '%', '> 25%'],
+  ['下方筹码占比', below >= 30, below.toFixed(2) + '%', '>= 30%'],
+  ['开发者持仓', !isNaN(devHoldPct) && devHoldPct < 8, isNaN(devHoldPct) ? '数据缺失' : devHoldPct.toFixed(2) + '%', '< 8%'],
 ]
 const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
 const passed = checks.every(c => c[1])
