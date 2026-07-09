@@ -32,28 +32,52 @@ if (ratHolder) {
   return false
 }
 
-// ===== 跌破斐波0.86 拉黑（只看当前市值）=====
-// 【斐波锚点】最低点固定为 0（不追踪前低/动态最低点），最高点为历史最高市值 max_up_mcap；
-//   0.86 回撤位市值 = 最高 × (1 - 0.86) = max_up_mcap × 0.14（即从高点跌超 86%、只剩 14% 才算跌破）。
-// 【跌破判断】只看当前市值 mcap 是否 < 0.86位，不再遍历K线历史、不判断"历史曾跌破"。
-//   当前市值跌破即 add_blacklist 永久拉黑。
-// ⚠️ add_blacklist 在纯【代币实时流】模式是空操作——上线看日志确认。
-const maxMcap = L.max_up_mcap || 0
+// ===== 跌破斐波0.86 拉黑（只看【外盘】，内盘跌破不算）=====
+// 【关键改动】斐波最高点/历史最低点都只用「毕业(launch_time)之后」的外盘K线来算，
+//   内盘时段(k.time < launch_time)的 high/low 一律不参与——所以内盘阶段的暴跌不会触发拉黑。
+// 【斐波锚点】最低=0；最高=外盘K线 high 的最大值(outerMaxMcap)；0.86位 = 外盘最高 × 0.14。
+// 【当前跌破】当前市值 mcap < 0.86位。
+// 【历史跌破】外盘K线 low 的最小值换算市值 < 0.86位（现价拉回上方也照样拉黑）。
+// 任一成立 → add_blacklist 永久拉黑。
+// ⚠️ 局限1：未毕业(launch_time=0)时没有外盘概念，直接跳过整段斐波拉黑，不做判断。
+// ⚠️ 局限2：外盘最高用「现有K线」的 high 算，若K线数组没回溯到真正的外盘最高点，会偏低；
+//   同理历史最低也受K线覆盖长度限制。K线在纯【代币实时流】模式可能拿不到、add_blacklist 也是空操作——上线看日志确认。
+const launchTime = L.launch_time || 0
 const mcap = L.mcap || 0
+const curPrice = Number(KI.current_price) || 0
+const klineBars = Array.isArray(KI.kline_bars) ? KI.kline_bars : []
 
-if (maxMcap > 0 && mcap > 0) {
-  const fibLow = 0 // 斐波那契最低点固定为 0
-  const fib086 = fibLow + (maxMcap - fibLow) * (1 - 0.86)
+if (launchTime > 0 && mcap > 0 && curPrice > 0 && klineBars.length > 0) {
+  const priceToMcap = mcap / curPrice
+  // 只取毕业之后的外盘K线
+  const outerBars = klineBars.filter(k => k && typeof k.time === 'number' && k.time >= launchTime && typeof k.high === 'number' && typeof k.low === 'number')
 
-  const curBroke = mcap < fib086 // 当前市值跌破
-  const blacklistChecks = [
-    ['当前市值跌破斐波0.86', curBroke, mcap.toFixed(0), '>= 0.86位' + fib086.toFixed(0) + '(最高' + maxMcap.toFixed(0) + '/最低0)'],
-  ]
-  const blackHit = blacklistChecks.filter(c => c[1])
-  if (blackHit.length) {
-    const reason = blackHit.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
-    ctx.add_blacklist(ca, reason)
-    return false
+  if (outerBars.length > 0) {
+    let maxHigh = -Infinity
+    let minLow = Infinity
+    for (const k of outerBars) {
+      if (k.high > maxHigh) maxHigh = k.high
+      if (k.low < minLow) minLow = k.low
+    }
+    const outerMaxMcap = maxHigh * priceToMcap // 外盘历史最高市值
+    const fib086 = outerMaxMcap * (1 - 0.86)   // 外盘最高 × 0.14
+    const histLowMcap = minLow * priceToMcap   // 外盘历史最低市值
+
+    const curBroke = mcap < fib086
+    const histBroke = histLowMcap < fib086
+    const fibInfo = '外盘最高' + outerMaxMcap.toFixed(0) + '/0.86位' + fib086.toFixed(0) + '/当前' + mcap.toFixed(0) + '/外盘最低' + histLowMcap.toFixed(0) + '(外盘K线' + outerBars.length + '根)'
+    ctx.log.info('斐波检查(仅外盘)  ' + fibInfo)
+
+    const blacklistChecks = [
+      ['当前市值跌破外盘斐波0.86', curBroke, mcap.toFixed(0), '>= 0.86位' + fib086.toFixed(0)],
+      ['外盘K线曾跌破斐波0.86', histBroke, histLowMcap.toFixed(0), '>= 0.86位' + fib086.toFixed(0)],
+    ]
+    const blackHit = blacklistChecks.filter(c => c[1])
+    if (blackHit.length) {
+      const reason = blackHit.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ') + '  |  ' + fibInfo
+      ctx.add_blacklist(ca, reason)
+      return false
+    }
   }
 }
 
@@ -62,7 +86,7 @@ if (typeof below !== 'number') {
   return false
 }
 
-// 开发者持仓占比（gmgn.stat.creator_hold_rate 是 0-1 小数，×100 转成 %；取不到时兜底用 dev.creator_token_status）
+// 开发者持仓占比（gmgn.stat.creator_hold_rate 是 0-1 小数，×100 转成 %）
 const stat = G.stat || {}
 const devHoldPct = stat.creator_hold_rate != null ? parseFloat(stat.creator_hold_rate) * 100 : NaN
 
