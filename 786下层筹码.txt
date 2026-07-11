@@ -59,26 +59,25 @@ if (maxMcap > 0 && mcap > 0) {
 
 // ===== 最近一次最大回撤 > 斐波0.86 拉黑 =====
 // 【算法】高点 = 历史最大市值 max_up_mcap（其出现时间 = max_up_mcap_time）；
-//   低点 = 遍历「最高点之后」(k.time > max_up_mcap_time) 的所有K线 low 的最小值，换算成市值；
+//   低点 = 遍历「最高点之后」(k.time > max_up_mcap_time) 的所有K线 low 的最小值；
+//   ★按用户确认：本策略快照里 K线 low 本身就是市值，直接当市值用，不再乘换算系数。
 //   回撤幅度 = (高点 - 低点) / 高点，> 0.86 即从最近高点跌超86%，自动拉黑。
 // ⚠️ 局限：低点用现有K线low现算，若K线没覆盖到高点之后的最低那段会偏高(漏判)；
 //   K线在纯【代币实时流】模式可能拿不到、add_blacklist 也是空操作——上线看日志确认。
 const maxMcapTime = L.max_up_mcap_time || 0
-const curPrice = Number(KI.current_price) || 0
 const klineBars = Array.isArray(KI.kline_bars) ? KI.kline_bars : []
 
-if (maxMcap > 0 && mcap > 0 && curPrice > 0 && maxMcapTime > 0 && klineBars.length > 0) {
-  const priceToMcap = mcap / curPrice
+if (maxMcap > 0 && maxMcapTime > 0 && klineBars.length > 0) {
   // 第一步：取最高点之后的所有K线
   const afterBars = klineBars.filter(k => k && typeof k.time === 'number' && k.time > maxMcapTime && typeof k.low === 'number')
 
   if (afterBars.length > 0) {
-    // 第二步：取这些K线 low 的最小值作为最低点
+    // 第二步：取这些K线 low 的最小值作为最低点（K线low直接就是市值）
     let minLow = Infinity
     for (const k of afterBars) {
       if (k.low < minLow) minLow = k.low
     }
-    const lowMcap = minLow * priceToMcap
+    const lowMcap = minLow
     const retracement = (maxMcap - lowMcap) / maxMcap // 回撤幅度 0-1
     const info = '高点' + maxMcap.toFixed(0) + '/高点后最低' + lowMcap.toFixed(0) + '/回撤' + (retracement * 100).toFixed(1) + '%(高点后K线' + afterBars.length + '根)'
     ctx.log.info('最近最大回撤检查  ' + info)
