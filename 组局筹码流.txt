@@ -1,0 +1,39 @@
+const chip = ctx.chip_analysis || {}
+const priceBars = Array.isArray(chip.price_bars) ? chip.price_bars : []
+const L = ctx.logearn || {}
+
+// ===== 反弹20%：需存在回调后反弹信号且已反弹到 20% 阶段（fibon_break1 有值）=====
+const vList = Array.isArray(L.v_breakout_volume_list) ? L.v_breakout_volume_list : []
+const hasRebound20 = vList.some(v => v && typeof v.fibon_break1 === 'number' && v.fibon_break1 > 0)
+
+// ===== 从历史市值斐波0.618，下方筹码占比必须≥70% =====
+// 0.618 回撤位市值 = 最高 × (1 - 0.618) = max_up_mcap × 0.382（低点固定0）；
+// 统计 price_bars 中"市值区间在 0.618 位下方"的筹码占比之和，占全部追踪筹码的比例需 ≥ 70%。
+const maxMcap = L.max_up_mcap || 0
+let belowFibRatio = 0
+if (maxMcap > 0 && priceBars.length > 0) {
+  const fib0618 = maxMcap * (1 - 0.618)
+  let belowSum = 0
+  let totalSum = 0
+  for (const b of priceBars) {
+    if (!b || !Array.isArray(b.mcap_range) || typeof b.percent !== 'number') continue
+    totalSum += b.percent
+    if (b.mcap_range[1] <= fib0618) belowSum += b.percent
+  }
+  belowFibRatio = totalSum > 0 ? (belowSum / totalSum) * 100 : 0
+}
+
+// ===== 8大持仓人群结构 + 反弹 + 0.618下方筹码 逐条判断 =====
+const checks = [
+  ['垃圾钱包占比', (L.shit_volume || 0) < 5, (L.shit_volume || 0).toFixed(2) + '%', '< 5%'],
+  ['新钱包持仓占比', (L.new_volume || 0) < 60, (L.new_volume || 0).toFixed(2) + '%', '< 60%'],
+  ['高频钱包持仓占比', (L.frequent_volume || 0) < 50, (L.frequent_volume || 0).toFixed(2) + '%', '< 50%'],
+  ['老钱包持仓占比', (L.old_volume || 0) < 70, (L.old_volume || 0).toFixed(2) + '%', '< 70%'],
+  ['已反弹20%(fibon_break1)', hasRebound20, hasRebound20, '存在反弹20%信号'],
+  ['0.618下方筹码占比', belowFibRatio >= 70, belowFibRatio.toFixed(2) + '%', '>= 70%'],
+]
+const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+const passed = checks.every(c => c[1])
+if (!passed) { ctx.log.error('未命中  ' + detail); return false }
+ctx.log.success('命中<回调反弹+底部筹码密集>  ' + detail)
+return true
