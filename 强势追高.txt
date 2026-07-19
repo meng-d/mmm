@@ -1,0 +1,128 @@
+// ✅ 信号触发策略：可使用 ctx.chip_analysis + 黑名单
+// 大票筛选 + 底部筹码密集(拉黑逻辑主导) + 跌破0.618拉黑 + 反弹信号回撤≥38.2%
+// 方案B：去掉普通checks里的「0.5下方筹码>=45%」，筹码达标与否由「拉黑2」决定
+// 本版：0.5下方筹码占比阈值从 70% 统一改为 45%
+const L = ctx.logearn || {}
+const ca = L.token_address
+const now = Math.floor(Date.now() / 1000)
+
+// pump.fun 发射平台标识（内盘那个地址；发射即固定，毕业后不变）
+const PUMP_FUN = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
+const isPumpFun = L.platform === PUMP_FUN
+
+// 创建时长（小时）：< 24 小时
+const createTime = L.swap_begin_time || now
+const ageHours = (now - createTime) / 3600
+
+// 历史最高市值 >= 200k（大票门槛，只增不减）
+const maxMcap = L.max_up_mcap || 0
+
+// 当前市值
+const mcap = L.mcap || 0
+
+// 当前市值的【浮动下限】= 历史最高×0.382（0.618回撤位）：随高点走，跌破即拉黑，未跌破即继续评估
+const fib0618Floor = maxMcap * (1 - 0.618)
+
+// ===== 拉黑0：创建时长超过24小时 → 直接永久拉黑 =====
+// 年龄只会随时间单调增长、跨过24h后永远回不去，属结构性永久条件，拉黑最合适（以后再来直接跳过、不耗API）
+const blacklistChecks0 = [
+  ['创建时长超过24小时', ageHours >= 24, ageHours.toFixed(2), '< 24'],
+]
+const blackHit0 = blacklistChecks0.filter(c => c[1])
+if (blackHit0.length) {
+  const reason = blackHit0.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
+  ctx.add_blacklist(ca, reason)
+  return false
+}
+
+// ===== 拉黑1：当前市值跌破历史最高市值斐波0.618位 → 直接永久拉黑 =====
+// 0.618回撤位市值 = maxMcap × (1 - 0.618) = maxMcap × 0.382；当前市值低于它=跌破0.618
+// 门槛：仅历史最高市值 >= 200k 才运行拉黑（小票不拉黑，留后路）；本段不访问筹码，不耗API
+// ⚠️ 注意：市值是动态的、可能回升，此处按你的要求「跌破即拉黑」以节省API，代价是可能误杀日后回暖的币
+if (maxMcap >= 200000) {
+  const blacklistChecks1 = [
+    ['跌破历史最高0.618位', mcap < fib0618Floor, mcap.toFixed(0), `>= ${fib0618Floor.toFixed(0)}`],
+  ]
+  const blackHit1 = blacklistChecks1.filter(c => c[1])
+  if (blackHit1.length) {
+    const reason = blackHit1.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
+    ctx.add_blacklist(ca, reason)
+    return false
+  }
+}
+
+// ===== 反弹信号回撤幅度：取【最新一条】v_breakout_volume 信号 =====
+// n_pattern_retracement (0~1) = 本轮从最高点跌到最低点的回撤幅度；>=0.382 即从高点回撤了 38.2% 以上
+const vbList = L.v_breakout_volume_list || []
+let latestVb = null
+for (const s of vbList) {
+  if (!s) continue
+  if (!latestVb || (Number(s.signalTime) || 0) > (Number(latestVb.signalTime) || 0)) latestVb = s
+}
+const vbRetracement = latestVb ? (Number(latestVb.n_pattern_retracement) || 0) : 0
+
+// ===== 前置轻量过滤(全部只用 ctx.logearn，不访问筹码/不耗API) =====
+const whaleMax = (L.whale_list || []).reduce((m, w) => Math.max(m, Number(w.whaleWalletCount) || 0), 0)
+const featuredCnt = (L.continue_breakout_volume_list || []).length // 精选
+const whaleCnt = (L.whale_list || []).length                       // 共振
+const vbCnt = vbList.length                                        // 反弹
+const awakeCnt = (L.breakout_volume_10x_list || []).length         // 苏醒
+const signalTotal = featuredCnt + whaleCnt + vbCnt + awakeCnt
+
+const preChecks = [
+  ['pump.fun发射', isPumpFun, L.platform, `== ${PUMP_FUN}`],
+  ['创建时长(小时)', ageHours < 24, ageHours.toFixed(2), '< 24'],
+  ['历史最高市值USD', maxMcap >= 200000, maxMcap.toFixed(0), '>= 200000'],
+  ['当前市值USD(浮动下限=高点x0.382)', mcap >= fib0618Floor, mcap.toFixed(0), `>= ${fib0618Floor.toFixed(0)}`],
+  ['反弹信号从高点回撤幅度', vbRetracement >= 0.382, (vbRetracement * 100).toFixed(1) + '%', '>= 38.2%'],
+  ['蓝筹顶级赢家共振钱包数', whaleMax > 0, whaleMax, '> 0'],
+  ['精选+共振+反弹+苏醒总次数', signalTotal > 10, `精${featuredCnt}+共${whaleCnt}+反${vbCnt}+苏${awakeCnt}=${signalTotal}`, '> 10'],
+  ['垃圾钱包占比', (L.shit_volume || 0) < 5, (L.shit_volume || 0).toFixed(2) + '%', '< 5%'],
+  ['新钱包持仓占比', (L.new_volume || 0) < 60, (L.new_volume || 0).toFixed(2) + '%', '< 60%'],
+  ['高频钱包持仓占比', (L.frequent_volume || 0) < 50, (L.frequent_volume || 0).toFixed(2) + '%', '< 50%'],
+  ['老钱包持仓占比', (L.old_volume || 0) < 70, (L.old_volume || 0).toFixed(2) + '%', '< 70%'],
+]
+// 前置条件不满足 → 静默过滤，等待下次；此时尚未访问筹码、不耗筹码API
+if (!preChecks.every(c => c[1])) { return false }
+
+// ===== 到这里前置全过，才读取筹码数据(此时才消耗筹码API) =====
+const chip = ctx.chip_analysis || {}
+const priceBars = Array.isArray(chip.price_bars) ? chip.price_bars : []
+
+// 从历史市值斐波0.5，计算下方筹码占比
+// 0.5 回撤位市值 = 最高 × (1 - 0.5) = max_up_mcap × 0.5（低点固定0）；
+// 统计 price_bars 中"市值区间在 0.5 位下方"的筹码占比之和，占全部追踪筹码的比例
+let belowFibRatio = 0
+let chipReady = false
+if (maxMcap > 0 && priceBars.length > 0) {
+  const fib05 = maxMcap * (1 - 0.5)
+  let belowSum = 0
+  let totalSum = 0
+  for (const b of priceBars) {
+    if (!b || !Array.isArray(b.mcap_range) || typeof b.percent !== 'number') continue
+    totalSum += b.percent
+    if (b.mcap_range[1] <= fib05) belowSum += b.percent
+  }
+  if (totalSum > 0) { belowFibRatio = (belowSum / totalSum) * 100; chipReady = true }
+}
+
+// ===== 拉黑2：0.5下方筹码占比不满45% → 拉黑 =====
+// 前置门槛：查到筹码数据(chipReady)；历史最高、当前市值、回撤幅度门槛已在前置过滤保证
+// ⚠️ 已删除原「当前市值<历史最高×0.7」门槛，仍在高位、下方本就没有低位筹码的盘也可能被拉黑，误杀新盘风险偏高，请留意
+if (chipReady) {
+  const blacklistChecks = [
+    ['0.5下方筹码占比不满45%', belowFibRatio < 45, belowFibRatio.toFixed(2) + '%', '>= 45%'],
+  ]
+  const blackHit = blacklistChecks.filter(c => c[1])
+  if (blackHit.length) {
+    const reason = blackHit.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
+    ctx.add_blacklist(ca, reason)
+    return false
+  }
+}
+
+// 走到这里说明：前置条件全过 + 筹码达标(或暂未取到筹码)
+const chipLabel = chipReady ? ((belowFibRatio >= 45) + '): ' + belowFibRatio.toFixed(2) + '%') : ('无数据): N/A')
+const detail = preChecks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ') + '  |  0.5下方筹码占比(' + chipLabel + ' [期望 >= 45%]'
+ctx.log.success('命中<200k大票+底部筹码密集+反弹回撤38.2%>  ' + detail)
+return true
