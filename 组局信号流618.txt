@@ -1,13 +1,12 @@
 // ✅ 信号触发策略：可使用 ctx.chip_analysis + 黑名单
 // 大票筛选 + 底部筹码密集(拉黑逻辑主导) + 跌破0.618拉黑
-// 方案B：去掉普通checks里的「0.618下方筹码>=70%」，避免高位盘每次空耗筹码判定；
-//        筹码达标与否完全由「拉黑2」决定——能走到普通checks说明要么没到拉黑门槛、要么筹码已达标
-// 普通过滤条件含「pump.fun 发射」(platform=6EF8...，该值发射即固定，毕业后不变)
+// 【本次改动】
+//   1）删除普通checks里「创建时长<24」这条死条件（年龄超24已在拉黑0 return，此处恒真、无过滤意义）
+//   2）当前市值真实下限改为「浮动、随高点走」= max(100k, 历史最高×0.382)——
+//      与拉黑1的0.618线统一：大票时下限被0.618线抬高，小/中票时保底100k
 const L = ctx.logearn || {}
 const ca = L.token_address
 const now = Math.floor(Date.now() / 1000)
-const chip = ctx.chip_analysis || {}
-const priceBars = Array.isArray(chip.price_bars) ? chip.price_bars : []
 
 // pump.fun 发射平台标识（内盘那个地址；发射即固定，毕业后不变）
 const PUMP_FUN = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
@@ -17,20 +16,30 @@ const isPumpFun = L.platform === PUMP_FUN
 const createTime = L.swap_begin_time || now
 const ageHours = (now - createTime) / 3600
 
-// 历史最高市值 > 220k
+// 历史最高市值 >= 200k
 const maxMcap = L.max_up_mcap || 0
 
-// 当前市值 > 100k
+// 当前市值
 const mcap = L.mcap || 0
 
+// ===== 拉黑0：创建时长超过24小时 → 直接永久拉黑 =====
+const ageBlacklistChecks = [
+  ['创建时长超过24小时', ageHours >= 24, ageHours.toFixed(2) + '小时', '< 24'],
+]
+const ageBlackHit = ageBlacklistChecks.filter(c => c[1])
+if (ageBlackHit.length) {
+  const reason = ageBlackHit.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
+  ctx.add_blacklist(ca, reason)
+  return false
+}
+
 // ===== 拉黑1：当前市值跌破历史最高市值斐波0.618位 → 直接永久拉黑 =====
-// 0.618回撤位市值 = maxMcap × (1 - 0.618) = maxMcap × 0.382；当前市值低于它=跌破0.618
-// 门槛：仅历史最高市值 > 220k 才运行拉黑（小票不拉黑，留后路）
-// ⚠️ 注意：市值是动态的、可能回升，此处按你的要求「跌破即拉黑」以节省API，代价是可能误杀日后回暖的币
+// 门槛：仅历史最高市值 >= 200k 才运行拉黑（小票不拉黑，留后路）
+// ⚠️ 市值是动态的、可能回升，按你要求「跌破即拉黑」以节省API，代价是可能误杀日后回暖的币
 const fib0618Floor = maxMcap * (1 - 0.618)
-if (maxMcap > 220000) {
+if (maxMcap >= 200000) {
   const blacklistChecks1 = [
-    ['跌破历史最高0.618位', mcap < fib0618Floor, mcap.toFixed(0), `>= ${fib0618Floor.toFixed(0)}`],
+    ['跌破历史最高0.618位', mcap < fib0618Floor, mcap.toFixed(0), '>= ' + fib0618Floor.toFixed(0)],
   ]
   const blackHit1 = blacklistChecks1.filter(c => c[1])
   if (blackHit1.length) {
@@ -50,56 +59,60 @@ const vbCnt = (L.v_breakout_volume_list || []).length              // 反弹
 const awakeCnt = (L.breakout_volume_10x_list || []).length         // 苏醒
 const signalTotal = featuredCnt + whaleCnt + vbCnt + awakeCnt
 
-// 从历史市值斐波0.618，计算下方筹码占比
-// 0.618 回撤位市值 = 最高 × (1 - 0.618) = max_up_mcap × 0.382（低点固定0）；
-// 统计 price_bars 中"市值区间在 0.618 位下方"的筹码占比之和，占全部追踪筹码的比例
+// ===== 未到 200k 前：不访问 ctx.chip_analysis，直接走普通checks过滤（返回false等待）=====
+// 只有历史最高市值 >= 200k 才开始计算/校验下方筹码；未达标的这次先过滤掉，等市值长大再来。
 let belowFibRatio = 0
 let chipReady = false
-if (maxMcap > 0 && priceBars.length > 0) {
-  const fib0618 = maxMcap * (1 - 0.618)
-  let belowSum = 0
-  let totalSum = 0
-  for (const b of priceBars) {
-    if (!b || !Array.isArray(b.mcap_range) || typeof b.percent !== 'number') continue
-    totalSum += b.percent
-    if (b.mcap_range[1] <= fib0618) belowSum += b.percent
+if (maxMcap >= 200000) {
+  const chip = ctx.chip_analysis || {}
+  const priceBars = Array.isArray(chip.price_bars) ? chip.price_bars : []
+
+  // 从历史市值斐波0.618，计算下方筹码占比
+  if (priceBars.length > 0) {
+    const fib0618 = maxMcap * (1 - 0.618)
+    let belowSum = 0
+    let totalSum = 0
+    for (const b of priceBars) {
+      if (!b || !Array.isArray(b.mcap_range) || typeof b.percent !== 'number') continue
+      totalSum += b.percent
+      if (b.mcap_range[1] <= fib0618) belowSum += b.percent
+    }
+    if (totalSum > 0) { belowFibRatio = (belowSum / totalSum) * 100; chipReady = true }
   }
-  if (totalSum > 0) { belowFibRatio = (belowSum / totalSum) * 100; chipReady = true }
+
+  // ===== 拉黑2：0.618下方筹码占比不满70% → 拉黑（只在已到200k且拿到筹码数据时执行）=====
+  if (chipReady) {
+    const blacklistChecks = [
+      ['0.618下方筹码占比不满70%', belowFibRatio < 70, belowFibRatio.toFixed(2) + '%', '>= 70%'],
+    ]
+    const blackHit = blacklistChecks.filter(c => c[1])
+    if (blackHit.length) {
+      const reason = blackHit.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
+      ctx.add_blacklist(ca, reason)
+      return false
+    }
+  }
 }
 
-// ===== 拉黑2：0.618下方筹码占比不满70% → 拉黑 =====
-// 前置门槛：① 查到筹码数据(chipReady) ② 历史最高市值 > 220k
-// ⚠️ 已按你要求删除原「门槛②：当前市值<历史最高×0.7」——
-//    这意味着刚发射/仍在高位、下方本就没有低位筹码的盘，也会因 0.618下方筹码<70% 被拉黑，误杀新盘风险回升，请留意。
-const allowChipBlacklist = chipReady && maxMcap > 220000
-if (allowChipBlacklist) {
-  const blacklistChecks = [
-    ['0.618下方筹码占比不满70%', belowFibRatio < 70, belowFibRatio.toFixed(2) + '%', '>= 70%'],
-  ]
-  const blackHit = blacklistChecks.filter(c => c[1])
-  if (blackHit.length) {
-    const reason = blackHit.map(([name, ok, actual, expect]) => `${name}: ${actual} [期望 ${expect}]`).join('  |  ')
-    ctx.add_blacklist(ca, reason)
-    return false
-  }
-}
+// 当前市值浮动下限 = max(100k, 历史最高×0.382)——随高点走
+// maxMcap 小时下限为保底100k；maxMcap 大时被0.618线抬高，与拉黑1口径统一
+const mcapFloor = Math.max(100000, fib0618Floor)
 
-// 方案B：普通checks 已移除「0.618下方筹码>=70%」这条——
-// 走到这里说明：要么没到拉黑门槛，要么筹码已达标，无需再卡一次
+// 方案B：普通checks 已移除「0.618下方筹码>=70%」和「创建时长<24」(死条件)两条
+// 「历史最高市值>=200k」这条同时兜住「未到200k直接过滤等待」的需求
 const checks = [
-  ['pump.fun发射', isPumpFun, L.platform, `== ${PUMP_FUN}`],
-  ['创建时长(小时)', ageHours < 24, ageHours.toFixed(2), '< 24'],
-  ['历史最高市值USD', maxMcap > 220000, maxMcap.toFixed(0), '> 220000'],
-  ['当前市值USD', mcap > 100000, mcap.toFixed(0), '> 100000'],
+  ['pump.fun发射', isPumpFun, L.platform, '== ' + PUMP_FUN],
+  ['历史最高市值USD', maxMcap >= 200000, maxMcap.toFixed(0), '>= 200000'],
+  ['当前市值USD(浮动下限)', mcap > mcapFloor, mcap.toFixed(0), '> ' + mcapFloor.toFixed(0) + '(=max(100k,最高×0.382))'],
   ['蓝筹顶级赢家共振钱包数', whaleMax > 0, whaleMax, '> 0'],
-  ['精选+共振+反弹+苏醒总次数', signalTotal > 10, `精${featuredCnt}+共${whaleCnt}+反${vbCnt}+苏${awakeCnt}=${signalTotal}`, '> 10'],
+  ['精选+共振+反弹+苏醒总次数', signalTotal > 10, '精' + featuredCnt + '+共' + whaleCnt + '+反' + vbCnt + '+苏' + awakeCnt + '=' + signalTotal, '> 10'],
   ['垃圾钱包占比', (L.shit_volume || 0) < 5, (L.shit_volume || 0).toFixed(2) + '%', '< 5%'],
   ['新钱包持仓占比', (L.new_volume || 0) < 60, (L.new_volume || 0).toFixed(2) + '%', '< 60%'],
   ['高频钱包持仓占比', (L.frequent_volume || 0) < 50, (L.frequent_volume || 0).toFixed(2) + '%', '< 50%'],
   ['老钱包持仓占比', (L.old_volume || 0) < 70, (L.old_volume || 0).toFixed(2) + '%', '< 70%'],
 ]
-const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
 const passed = checks.every(c => c[1])
-if (!passed) { ctx.log.error('未命中  ' + detail); return false }
-ctx.log.success('命中<220k大票+底部筹码密集>  ' + detail)
+if (!passed) { return false }
+const detail = checks.map(([name, ok, actual, expect]) => `${name}(${ok}): ${actual} [期望 ${expect}]`).join('  |  ')
+ctx.log.success('命中<200k大票+底部筹码密集>  ' + detail)
 return true
