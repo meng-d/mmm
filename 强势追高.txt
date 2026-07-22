@@ -1,25 +1,42 @@
 // 信号触发策略：大票+底部筹码密集+反弹回撤38.2%；含黑名单+3项持有人筛选
-// 本版：大票门槛从 200k 提高到 350k（历史最高市值检查 + 0.618拉黑门槛 一起同步）
+// 本版：拉黑2 = 0.5下方筹码占比 < 55% 直接拉黑（要求底部筹码 >= 55% 才放行，符合底部支撑越强越好）
 const L = ctx.logearn || {}
 const ca = L.token_address
+const sym = L.symbol || ''
 const now = Math.floor(Date.now() / 1000)
 const PUMP_FUN = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
 const BLACK_ADDR = 'BAr5csYtpWoNpwhUjixX7ZPHXkUciFZzjBp9uNxZXJPh'
-const BIG_MCAP = 350000 // 大票门槛：历史最高市值下限 + 触发0.618拉黑的门槛，统一用这个常量
+const BIG_MCAP = 250000
+const CHIP_MIN = 55 // 0.5下方筹码占比达标线(%)，低于即拉黑
 const ageHours = (now - (L.swap_begin_time || now)) / 3600
 const maxMcap = L.max_up_mcap || 0
 const mcap = L.mcap || 0
 const fib0618Floor = maxMcap * (1 - 0.618)
+const fmtDetail = (arr) => arr.map(([n, ok, a, e]) => `${n}(${ok}): ${a} [期望 ${e}]`).join('  |  ')
 
 // 拉黑0：年龄超24h
-if (ageHours >= 24) { ctx.add_blacklist(ca, `创建时长超过24小时: ${ageHours.toFixed(2)} [期望 < 24]`); return false }
-// 拉黑1：大票跌破0.618（门槛同步为 350k）
-if (maxMcap >= BIG_MCAP && mcap < fib0618Floor) { ctx.add_blacklist(ca, `跌破历史最高0.618位: ${mcap.toFixed(0)} [期望 >= ${fib0618Floor.toFixed(0)}]`); return false }
+if (ageHours >= 24) {
+  const reason = `创建时长超过24小时: ${ageHours.toFixed(2)} [期望 < 24]`
+  ctx.log.error(`[${sym}] 拉黑-年龄超限  ${reason}`)
+  ctx.add_blacklist(ca, reason)
+  return false
+}
+// 拉黑1：大票跌破0.618
+if (maxMcap > BIG_MCAP && mcap < fib0618Floor) {
+  const reason = `跌破历史最高0.618位: ${mcap.toFixed(0)} [期望 >= ${fib0618Floor.toFixed(0)}]`
+  ctx.log.error(`[${sym}] 拉黑-跌破0.618  ${reason}`)
+  ctx.add_blacklist(ca, reason)
+  return false
+}
 
-// 最新反弹信号回撤幅度
+// 最新一条反弹信号的回撤幅度
 const vbList = L.v_breakout_volume_list || []
-let vbRetracement = 0
-for (const s of vbList) { if (s && (Number(s.signalTime) || 0) >= 0) vbRetracement = Math.max(vbRetracement, Number(s.n_pattern_retracement) || 0) }
+let latestVb = null
+for (const s of vbList) {
+  if (!s) continue
+  if (!latestVb || (Number(s.signalTime) || 0) > (Number(latestVb.signalTime) || 0)) latestVb = s
+}
+const vbRetracement = latestVb ? (Number(latestVb.n_pattern_retracement) || 0) : 0
 
 const whaleMax = (L.whale_list || []).reduce((m, w) => Math.max(m, Number(w.whaleWalletCount) || 0), 0)
 const featuredCnt = (L.continue_breakout_volume_list || []).length
@@ -31,9 +48,9 @@ const signalTotal = featuredCnt + whaleCnt + vbCnt + awakeCnt
 const preChecks = [
   ['pump.fun发射', L.platform === PUMP_FUN, L.platform, `== ${PUMP_FUN}`],
   ['创建时长(小时)', ageHours < 24, ageHours.toFixed(2), '< 24'],
-  ['历史最高市值USD', maxMcap >= BIG_MCAP, maxMcap.toFixed(0), `>= ${BIG_MCAP}`],
+  ['历史最高市值USD', maxMcap > BIG_MCAP, maxMcap.toFixed(0), `> ${BIG_MCAP}`],
   ['当前市值USD(下限=高点x0.382)', mcap >= fib0618Floor, mcap.toFixed(0), `>= ${fib0618Floor.toFixed(0)}`],
-  ['反弹回撤幅度', vbRetracement >= 0.382, (vbRetracement * 100).toFixed(1) + '%', '>= 38.2%'],
+  ['最新反弹回撤幅度', vbRetracement >= 0.382, (vbRetracement * 100).toFixed(1) + '%', '>= 38.2%'],
   ['共振钱包数', whaleMax > 0, whaleMax, '> 0'],
   ['信号总次数', signalTotal > 10, `精${featuredCnt}+共${whaleCnt}+反${vbCnt}+苏${awakeCnt}=${signalTotal}`, '> 10'],
   ['垃圾钱包占比', (L.shit_volume || 0) < 5, (L.shit_volume || 0).toFixed(2) + '%', '< 5%'],
@@ -41,7 +58,10 @@ const preChecks = [
   ['高频钱包占比', (L.frequent_volume || 0) < 50, (L.frequent_volume || 0).toFixed(2) + '%', '< 50%'],
   ['老钱包占比', (L.old_volume || 0) < 70, (L.old_volume || 0).toFixed(2) + '%', '< 70%'],
 ]
-if (!preChecks.every(c => c[1])) { return false }
+if (!preChecks.every(c => c[1])) {
+  ctx.log.error(`[${sym}] 未过前置  ` + fmtDetail(preChecks))
+  return false
+}
 
 // 前置全过，才读筹码/持有人
 const chip = ctx.chip_analysis || {}
@@ -71,11 +91,19 @@ const extraChecks = [
   ['Top5单钱包持仓', maxTop5Hold <= 10, maxTop5Hold.toFixed(2) + '%', '<= 10%'],
   ['Top5最大转入占比', maxTop5TransferIn <= 5, maxTop5TransferIn.toFixed(2) + '%', '<= 5%'],
 ]
-if (!extraChecks.every(c => c[1])) { return false }
+if (!extraChecks.every(c => c[1])) {
+  ctx.log.error(`[${sym}] 未过持有人筛选  筹码占比=${chipPctText}  ` + fmtDetail(preChecks.concat(extraChecks)))
+  return false
+}
 
-// 拉黑2：0.5下方筹码不满45%
-if (chipReady && belowFibRatio < 45) { ctx.add_blacklist(ca, `0.5下方筹码占比不满45%: ${chipPctText} [期望 >= 45%]`); return false }
+// 拉黑2：0.5下方筹码占比 < 55% 直接拉黑（要求 >= 55%）
+if (chipReady && belowFibRatio < CHIP_MIN) {
+  const reason = `0.5下方筹码占比不满${CHIP_MIN}%: ${chipPctText} [期望 >= ${CHIP_MIN}%]`
+  ctx.log.error(`[${sym}] 拉黑-底部筹码不足  ${reason}`)
+  ctx.add_blacklist(ca, reason)
+  return false
+}
 
-const detail = preChecks.concat(extraChecks).map(([n, ok, a, e]) => `${n}(${ok}): ${a} [期望 ${e}]`).join('  |  ')
-ctx.log.success(`命中<350k大票+底部筹码密集+反弹回撤38.2%>  筹码占比=${chipPctText}  ` + detail)
+const detail = fmtDetail(preChecks.concat(extraChecks))
+ctx.log.success(`命中<250k大票+底部筹码密集+反弹回撤38.2%>[${sym}]  筹码占比=${chipPctText}  ` + detail)
 return true
